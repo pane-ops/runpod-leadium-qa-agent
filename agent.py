@@ -13,7 +13,6 @@ Rows are processed when: column D (Question) has content AND column I (Guidance)
 import json
 import logging
 import os
-import re
 import time
 import argparse
 from typing import Optional
