@@ -522,11 +522,16 @@ def classify_row(row: list[str], hubspot_data: Optional[dict]) -> dict:
     for attempt in range(2):  # 1 retry on parse failure
         resp = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2048,  # raised from 1024 — long responses were getting cut off
+            max_tokens=2048,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+            messages=[
+                {"role": "user", "content": user_message},
+                # Prefill forces Claude to continue from '{' — guarantees JSON output
+                {"role": "assistant", "content": "{"},
+            ],
         )
-        raw = resp.content[0].text.strip() if resp.content else ""
+        # Re-attach the opening brace we prefilled
+        raw = "{" + (resp.content[0].text.strip() if resp.content else "")
         try:
             return _extract_json(raw)
         except (json.JSONDecodeError, ValueError) as exc:
