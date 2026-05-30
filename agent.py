@@ -13,6 +13,7 @@ Rows are processed when: column D (Question) has content AND column I (Guidance)
 import json
 import logging
 import os
+import re
 import time
 import argparse
 from typing import Optional
@@ -461,6 +462,46 @@ def lookup_hubspot_contact(email: str) -> Optional[dict]:
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 
+def _extract_json(text: str) -> dict:
+    """Robustly extract a JSON object from Claude's response using multiple strategies."""
+    if not text:
+        raise ValueError("Empty response from Claude")
+
+    # Strategy 1: direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: strip markdown code fences (```json ... ``` or ``` ... ```)
+    stripped = re.sub(r'^```(?:json)?\s*\n?', '', text.strip())
+    stripped = re.sub(r'\n?```\s*$', '', stripped).strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 3: find the outermost { ... } block
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 4: escape unescaped literal newlines inside string values
+    # (Claude occasionally puts raw \n in JSON strings instead of \\n)
+    candidate = match.group() if match else stripped
+    try:
+        # Replace bare newlines that appear inside JSON strings
+        fixed = re.sub(r'(?<!\\)\n', r'\\n', candidate)
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    raise ValueError(f"Could not extract JSON. Response was: {text[:300]!r}")
+
+
 def classify_row(row: list[str], hubspot_data: Optional[dict]) -> dict:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -477,19 +518,24 @@ def classify_row(row: list[str], hubspot_data: Optional[dict]) -> dict:
         "Classify this prospect and draft the appropriate response."
     )
 
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
+    last_exc: Exception = ValueError("No attempts made")
+    for attempt in range(2):  # 1 retry on parse failure
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,  # raised from 1024 — long responses were getting cut off
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        raw = resp.content[0].text.strip() if resp.content else ""
+        try:
+            return _extract_json(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_exc = exc
+            log.warning(f"  JSON parse failed (attempt {attempt + 1}): {exc}")
+            if attempt == 0:
+                time.sleep(1)  # brief pause before retry
 
-    text = resp.content[0].text.strip()
-    # Strip accidental markdown code fences
-    if text.startswith("```"):
-        lines = text.splitlines()
-        text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
-    return json.loads(text)
+    raise last_exc
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
