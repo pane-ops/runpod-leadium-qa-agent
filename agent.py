@@ -462,44 +462,40 @@ def lookup_hubspot_contact(email: str) -> Optional[dict]:
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 
-def _extract_json(text: str) -> dict:
-    """Robustly extract a JSON object from Claude's response using multiple strategies."""
-    if not text:
-        raise ValueError("Empty response from Claude")
-
-    # Strategy 1: direct parse
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Strategy 2: strip markdown code fences (```json ... ``` or ``` ... ```)
-    stripped = re.sub(r'^```(?:json)?\s*\n?', '', text.strip())
-    stripped = re.sub(r'\n?```\s*$', '', stripped).strip()
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-
-    # Strategy 3: find the outermost { ... } block
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-
-    # Strategy 4: escape unescaped literal newlines inside string values
-    # (Claude occasionally puts raw \n in JSON strings instead of \\n)
-    candidate = match.group() if match else stripped
-    try:
-        # Replace bare newlines that appear inside JSON strings
-        fixed = re.sub(r'(?<!\\)\n', r'\\n', candidate)
-        return json.loads(fixed)
-    except json.JSONDecodeError:
-        pass
-
-    raise ValueError(f"Could not extract JSON. Response was: {text[:300]!r}")
+# Tool definition forces structured output — Claude must call this with the exact schema,
+# eliminating all JSON parsing issues regardless of model version.
+CLASSIFY_TOOL = {
+    "name": "classify_prospect",
+    "description": "Classify a sales prospect and generate BDR guidance.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "Route to AE",
+                    "Send Self Serve Email",
+                    "Send Follow Up Questions",
+                    "Send Suggested Response",
+                    "Hold",
+                ],
+            },
+            "suggested_response": {
+                "type": "string",
+                "description": "Exact message Leadium sends to the prospect. Empty string if Route to AE or Hold.",
+            },
+            "runpod_notes": {
+                "type": "string",
+                "description": "Internal reasoning, 1-2 sentences.",
+            },
+            "request_status": {
+                "type": "string",
+                "enum": ["Pending", "Skipped"],
+            },
+        },
+        "required": ["action", "suggested_response", "runpod_notes", "request_status"],
+    },
+}
 
 
 def classify_row(row: list[str], hubspot_data: Optional[dict]) -> dict:
@@ -518,29 +514,18 @@ def classify_row(row: list[str], hubspot_data: Optional[dict]) -> dict:
         "Classify this prospect and draft the appropriate response."
     )
 
-    last_exc: Exception = ValueError("No attempts made")
-    for attempt in range(2):  # 1 retry on parse failure
-        resp = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": user_message},
-                # Prefill forces Claude to continue from '{' — guarantees JSON output
-                {"role": "assistant", "content": "{"},
-            ],
-        )
-        # Re-attach the opening brace we prefilled
-        raw = "{" + (resp.content[0].text.strip() if resp.content else "")
-        try:
-            return _extract_json(raw)
-        except (json.JSONDecodeError, ValueError) as exc:
-            last_exc = exc
-            log.warning(f"  JSON parse failed (attempt {attempt + 1}): {exc}")
-            if attempt == 0:
-                time.sleep(1)  # brief pause before retry
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        system=SYSTEM_PROMPT,
+        tools=[CLASSIFY_TOOL],
+        tool_choice={"type": "tool", "name": "classify_prospect"},
+        messages=[{"role": "user", "content": user_message}],
+    )
 
-    raise last_exc
+    # Tool use guarantees structured output — no JSON parsing needed
+    tool_block = next(b for b in resp.content if b.type == "tool_use")
+    return tool_block.input
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
