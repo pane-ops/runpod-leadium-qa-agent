@@ -687,6 +687,26 @@ def probe_email_thread(email: str) -> None:
     print(f"Contact ID: {contact['id']}")
     print(f"Properties: {json.dumps(contact['properties'], indent=2)}\n")
 
+    # --- RAW DIAGNOSTICS (probe only) ---
+    cid = contact["id"]
+    aurl = f"{HUBSPOT_BASE}/crm/v4/objects/contacts/{cid}/associations/emails"
+    ar = requests.get(aurl, headers=_hs_headers(), params={"limit": 100}, timeout=15)
+    print(f"[diag] assoc GET {aurl}\n[diag] status={ar.status_code} body={ar.text[:800]}\n")
+    try:
+        ids = [a.get("toObjectId") for a in ar.json().get("results", [])]
+    except Exception:
+        ids = []
+    print(f"[diag] associated email ids: {ids}")
+    if ids:
+        rr = requests.post(
+            f"{HUBSPOT_BASE}/crm/v3/objects/emails/batch/read",
+            headers=_hs_headers(),
+            json={"properties": ["hs_timestamp", "hs_email_from_email", "hs_email_subject", "hs_email_text"],
+                  "inputs": [{"id": str(i)} for i in ids[:20]]},
+            timeout=20,
+        )
+        print(f"[diag] batch/read status={rr.status_code} body={rr.text[:800]}\n")
+
     thread = get_email_thread(contact["id"])
     print(f"Email thread: {len(thread)} message(s)\n")
     print(format_thread(thread))
