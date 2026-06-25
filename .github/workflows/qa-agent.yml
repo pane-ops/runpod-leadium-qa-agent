@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 * * * *"   # every hour on the hour
   workflow_dispatch:       # manual trigger from GitHub UI
+    inputs:
+      probe_email:
+        description: "Diagnostic: dump email thread + classification for one contact (no sheet writes). Leave blank for a normal run."
+        required: false
+        default: ""
 
 jobs:
   run-agent:
@@ -31,4 +36,5 @@ jobs:
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
           GOOGLE_SHEETS_ID:     ${{ secrets.GOOGLE_SHEETS_ID }}
           WORKSHEET_NAME:       ${{ vars.WORKSHEET_NAME }}
+          PROBE_EMAIL:          ${{ github.event.inputs.probe_email }}
         run: python agent.py
