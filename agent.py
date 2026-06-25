@@ -84,6 +84,23 @@ Your job: determine the correct action and draft a response for each prospect.
 
 ---
 
+## CRITICAL: This is an ongoing conversation, not a first touch
+
+For most prospects you are given the FULL EMAIL THREAD between our BDR (Matt/Jason, sending from @runpod.io) and the prospect. READ THE ENTIRE THREAD before drafting anything. The prospect's "latest message" is a reply within that thread — not a cold first contact.
+
+Hard rules:
+- NEVER ask a question the prospect (or their thread) has already answered. Re-asking something they already told us is the single worst mistake you can make here — it makes us look like we weren't listening.
+- Do NOT open with cold-intro language ("Thanks for your interest in Runpod", "Here are a few things worth looking at…") when a back-and-forth already exists. Pick up where the thread left off.
+- Mine the thread for everything already shared — GPU types, usage pattern, concurrent GPU count, spend, timeline, region, budget — and use it to route and to decide what (if anything) is still genuinely unknown.
+- If the thread already gives enough to qualify (≥$3K signals, multi-node/cluster, explicitly ready to commit), Route to AE. Do not keep asking qualifying questions.
+- If only SOME questions are answered, acknowledge what they shared and ask ONLY the specific items still missing.
+- If the thread shows we already sent the self-serve email or the standard follow-up questions, do not repeat them — advance the conversation instead.
+- The standard 6 follow-up questions are a menu, not a script. Drop every one the thread already answers.
+
+If no thread is provided, treat it as an earlier-stage touch — but still read the latest message carefully for details already provided and skip those questions.
+
+---
+
 ## RunPod Products
 
 **Pods**
@@ -457,12 +474,19 @@ def write_guidance(
 
 # ── HubSpot ───────────────────────────────────────────────────────────────────
 
-def lookup_hubspot_contact(email: str) -> Optional[dict]:
-    url = "https://api.hubapi.com/crm/v3/objects/contacts/search"
-    headers = {
+HUBSPOT_BASE = "https://api.hubapi.com"
+
+
+def _hs_headers() -> dict:
+    return {
         "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
+
+
+def lookup_hubspot_contact(email: str) -> Optional[dict]:
+    """Return {"id": <contact_id>, "properties": {...non-empty props...}} or None."""
+    url = f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search"
     payload = {
         "filterGroups": [
             {"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}
@@ -471,16 +495,89 @@ def lookup_hubspot_contact(email: str) -> Optional[dict]:
         "limit": 1,
     }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        resp = requests.post(url, headers=_hs_headers(), json=payload, timeout=10)
         resp.raise_for_status()
         results = resp.json().get("results", [])
         if results:
-            # Return only non-empty properties
             props = results[0].get("properties", {})
-            return {k: v for k, v in props.items() if v}
+            return {
+                "id": results[0].get("id"),
+                "properties": {k: v for k, v in props.items() if v},
+            }
     except Exception as exc:
         log.warning(f"HubSpot lookup failed for {email}: {exc}")
     return None
+
+
+def _email_direction(props: dict) -> str:
+    """Who sent this email — 'RunPod' (our BDR) or 'Prospect'."""
+    frm = (props.get("hs_email_from_email") or "").lower()
+    if frm:
+        return "RunPod" if "runpod.io" in frm else "Prospect"
+    # Fallback: Leadium logs outbound with ">>" and inbound with "<<" in the subject.
+    subj = props.get("hs_email_subject") or ""
+    if ">>" in subj:
+        return "RunPod"
+    if "<<" in subj:
+        return "Prospect"
+    return "Unknown"
+
+
+def get_email_thread(contact_id: str, limit: int = 12) -> list[dict]:
+    """Pull the chronological email exchange for a contact from HubSpot.
+
+    Returns a list of {"sender", "timestamp", "subject", "body"} oldest-first.
+    Returns [] (and logs) if the Service Key lacks the email-read scope or the
+    contact has no logged emails.
+    """
+    if not contact_id:
+        return []
+    url = f"{HUBSPOT_BASE}/crm/v3/objects/emails/search"
+    payload = {
+        "filterGroups": [
+            {"filters": [{"propertyName": "associations.contact", "operator": "EQ", "value": str(contact_id)}]}
+        ],
+        "properties": [
+            "hs_timestamp", "hs_email_subject", "hs_email_text",
+            "hs_email_from_email", "hs_email_to_email",
+        ],
+        "sorts": [{"propertyName": "hs_timestamp", "direction": "ASCENDING"}],
+        "limit": limit,
+    }
+    try:
+        resp = requests.post(url, headers=_hs_headers(), json=payload, timeout=15)
+        resp.raise_for_status()
+        thread = []
+        for e in resp.json().get("results", []):
+            p = e.get("properties", {})
+            body = (p.get("hs_email_text") or "").strip()
+            if not body:
+                continue
+            thread.append({
+                "sender": _email_direction(p),
+                "timestamp": p.get("hs_timestamp", ""),
+                "subject": p.get("hs_email_subject", ""),
+                "body": body,
+            })
+        return thread
+    except Exception as exc:
+        log.warning(f"HubSpot email thread fetch failed for contact {contact_id}: {exc}")
+        return []
+
+
+def format_thread(thread: list[dict], max_body: int = 1500) -> str:
+    """Render the email thread into a readable transcript for the prompt."""
+    blocks = []
+    for m in thread:
+        who = "RunPod (our BDR)" if m["sender"] == "RunPod" else (
+            "PROSPECT" if m["sender"] == "Prospect" else "Unknown sender"
+        )
+        body = m["body"]
+        if len(body) > max_body:
+            body = body[:max_body] + " […truncated]"
+        ts = (m["timestamp"] or "")[:10]
+        blocks.append(f"[{ts}] {who}:\n{body}")
+    return "\n\n".join(blocks)
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 
@@ -520,20 +617,41 @@ CLASSIFY_TOOL = {
 }
 
 
-def classify_row(row: list[str], hubspot_data: Optional[dict]) -> dict:
+def classify_row(
+    row: list[str],
+    hubspot_data: Optional[dict],
+    email_thread: Optional[list[dict]] = None,
+) -> dict:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
     hs_block = ""
     if hubspot_data:
         hs_block = f"\n\nHubSpot Account Data (from Snowflake sync):\n{json.dumps(hubspot_data, indent=2)}"
 
+    thread_block = ""
+    if email_thread:
+        thread_block = (
+            "\n\n=== FULL EMAIL THREAD SO FAR (oldest first) ===\n"
+            "This is the real exchange between our BDR and the prospect. Read it carefully "
+            "and do NOT re-ask anything already answered here.\n\n"
+            f"{format_thread(email_thread)}\n"
+            "=== END EMAIL THREAD ==="
+        )
+    else:
+        thread_block = (
+            "\n\n(No prior email thread available for this prospect — treat as an earlier-stage "
+            "touch, but still read the latest message carefully for details already provided.)"
+        )
+
     user_message = (
         f"Prospect Email: {row[COL_EMAIL]}\n"
         f"Lead Type: {row[COL_TYPE] or '—'}\n"
-        f"Additional Context (from our team): {row[COL_NOTES] or '—'}\n\n"
-        f"Prospect's Message:\n{row[COL_QUESTION]}"
+        f"Additional Context (from our team): {row[COL_NOTES] or '—'}\n"
+        f"{thread_block}\n\n"
+        f"Prospect's LATEST message (the one needing guidance now):\n{row[COL_QUESTION]}"
         f"{hs_block}\n\n"
-        "Classify this prospect and draft the appropriate response."
+        "Using the full thread above, classify this prospect and draft the appropriate "
+        "response. Pick up where the conversation left off — never re-ask answered questions."
     )
 
     resp = client.messages.create(
@@ -551,11 +669,51 @@ def classify_row(row: list[str], hubspot_data: Optional[dict]) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def probe_email_thread(email: str) -> None:
+    """Write-free diagnostic: look up a contact, dump their email thread, and run a
+    classification against their latest message. Used to validate HubSpot email-read
+    access and thread-aware drafting without touching the sheet."""
+    email = email.strip().strip("<>").strip()
+    log.info(f"PROBE for {email}")
+    contact = lookup_hubspot_contact(email)
+    if not contact:
+        print(f"No HubSpot contact found for {email}")
+        return
+    print(f"Contact ID: {contact['id']}")
+    print(f"Properties: {json.dumps(contact['properties'], indent=2)}\n")
+
+    thread = get_email_thread(contact["id"])
+    print(f"Email thread: {len(thread)} message(s)\n")
+    print(format_thread(thread))
+    print(f"\n{'='*60}")
+
+    last_prospect = next(
+        (m["body"] for m in reversed(thread) if m["sender"] == "Prospect"), ""
+    )
+    if not last_prospect:
+        print("No inbound prospect message found to classify.")
+        return
+    row = ["", "", email, last_prospect, "", "", "", "", ""]
+    result = classify_row(row, contact["properties"], thread)
+    print("\nCLASSIFICATION (write-free):")
+    print(format_guidance(
+        result.get("action", ""),
+        result.get("suggested_response", ""),
+        result.get("runpod_notes", ""),
+    ))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="RunPod Leadium Q&A Agent")
     parser.add_argument("--dry-run", action="store_true", help="Classify rows but do not write to sheet")
     parser.add_argument("--limit", type=int, default=0, help="Max rows to process (0 = all)")
+    parser.add_argument("--probe-email", default=os.environ.get("PROBE_EMAIL", ""),
+                        help="Diagnostic: dump email thread + classify for one contact, no writes")
     args = parser.parse_args()
+
+    if args.probe_email:
+        probe_email_thread(args.probe_email)
+        return
 
     log.info("RunPod Leadium Q&A Agent starting%s", " [DRY RUN]" if args.dry_run else "")
 
@@ -567,14 +725,19 @@ def main() -> None:
         pending = pending[: args.limit]
 
     for row_idx, row in pending:
-        email = row[COL_EMAIL]
+        email = row[COL_EMAIL].strip().strip("<>").strip()
         log.info(f"Row {row_idx}: {email}")
 
-        hs_data = lookup_hubspot_contact(email) if email else None
-        log.info(f"  HubSpot: {'found' if hs_data else 'no record'}")
+        contact = lookup_hubspot_contact(email) if email else None
+        hs_data = contact["properties"] if contact else None
+        contact_id = contact["id"] if contact else None
+        log.info(f"  HubSpot: {'found' if contact else 'no record'}")
+
+        email_thread = get_email_thread(contact_id) if contact_id else []
+        log.info(f"  Email thread: {len(email_thread)} message(s)")
 
         try:
-            result = classify_row(row, hs_data)
+            result = classify_row(row, hs_data, email_thread)
             action   = result.get("action", "")
             response = result.get("suggested_response", "")
             notes    = result.get("runpod_notes", "")
