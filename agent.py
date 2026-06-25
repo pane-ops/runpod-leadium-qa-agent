@@ -467,6 +467,7 @@ def sanitize_text(s: str) -> str:
     if not s:
         return s
     s = re.sub(r"\s*—\s*", ", ", s)        # em-dash (always an aside) -> ", "
+    s = re.sub(r"\s*-{2,}\s*", ", ", s)    # "--"/"---" used as a dash -> ", " (ranges use one hyphen)
     s = re.sub(r"\s+–\s+", ", ", s)        # spaced en-dash (aside) -> ", "
     s = s.replace("–", "-")                # tight en-dash (range) -> hyphen
     s = s.replace("×", "x").replace("≈", "about ").replace("•", "-")
