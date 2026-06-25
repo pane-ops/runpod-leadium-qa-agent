@@ -10,9 +10,11 @@ guidance cell (column I) in the same row for the BDR to act on.
 Rows are processed when: column D (Question) has content AND column I (Guidance) is empty.
 """
 
+import html as _html
 import json
 import logging
 import os
+import re
 import time
 import argparse
 from typing import Optional
@@ -509,6 +511,22 @@ def lookup_hubspot_contact(email: str) -> Optional[dict]:
     return None
 
 
+def _html_to_text(s: Optional[str]) -> str:
+    """Strip an HTML email body down to readable plain text. HubSpot returns
+    one-to-one email content in hs_email_html (hs_email_text is often null)."""
+    if not s:
+        return ""
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</(p|div|tr|h[1-6])>", "\n", s)
+    s = re.sub(r"(?i)<li[^>]*>", "- ", s)
+    s = re.sub(r"(?i)</li>", "\n", s)
+    s = re.sub(r"<[^>]+>", "", s)          # drop remaining tags
+    s = _html.unescape(s)
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)       # collapse blank-line runs
+    return s.strip()
+
+
 def _email_direction(props: dict) -> str:
     """Who sent this email — 'RunPod' (our BDR) or 'Prospect'."""
     frm = (props.get("hs_email_from_email") or "").lower()
@@ -533,7 +551,7 @@ def get_email_thread(contact_id: str, limit: int = 20) -> list[dict]:
     if not contact_id:
         return []
     props = [
-        "hs_timestamp", "hs_email_subject", "hs_email_text",
+        "hs_timestamp", "hs_email_subject", "hs_email_text", "hs_email_html",
         "hs_email_from_email", "hs_email_to_email",
     ]
     try:
@@ -554,7 +572,7 @@ def get_email_thread(contact_id: str, limit: int = 20) -> list[dict]:
         thread = []
         for e in rr.json().get("results", []):
             p = e.get("properties", {})
-            body = (p.get("hs_email_text") or "").strip()
+            body = (p.get("hs_email_text") or "").strip() or _html_to_text(p.get("hs_email_html"))
             if not body:
                 continue
             thread.append({
@@ -686,33 +704,6 @@ def probe_email_thread(email: str) -> None:
         return
     print(f"Contact ID: {contact['id']}")
     print(f"Properties: {json.dumps(contact['properties'], indent=2)}\n")
-
-    # --- RAW DIAGNOSTICS (probe only) ---
-    cid = contact["id"]
-    aurl = f"{HUBSPOT_BASE}/crm/v4/objects/contacts/{cid}/associations/emails"
-    ar = requests.get(aurl, headers=_hs_headers(), params={"limit": 100}, timeout=15)
-    print(f"[diag] assoc GET {aurl}\n[diag] status={ar.status_code} body={ar.text[:800]}\n")
-    try:
-        ids = [a.get("toObjectId") for a in ar.json().get("results", [])]
-    except Exception:
-        ids = []
-    print(f"[diag] associated email ids: {ids}")
-    if ids:
-        rr = requests.post(
-            f"{HUBSPOT_BASE}/crm/v3/objects/emails/batch/read",
-            headers=_hs_headers(),
-            json={"properties": ["hs_timestamp", "hs_email_from_email", "hs_email_subject",
-                                 "hs_email_text", "hs_email_html"],
-                  "inputs": [{"id": str(i)} for i in ids[:20]]},
-            timeout=20,
-        )
-        print(f"[diag] batch/read status={rr.status_code}")
-        for e in rr.json().get("results", []):
-            p = e.get("properties", {})
-            txt = p.get("hs_email_text")
-            html = p.get("hs_email_html")
-            print(f"[diag]   id={e.get('id')} from={p.get('hs_email_from_email')} "
-                  f"text_len={len(txt) if txt else 0} html_len={len(html) if html else 0}")
 
     thread = get_email_thread(contact["id"])
     print(f"Email thread: {len(thread)} message(s)\n")
