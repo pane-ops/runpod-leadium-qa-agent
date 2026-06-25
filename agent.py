@@ -523,7 +523,7 @@ def _email_direction(props: dict) -> str:
     return "Unknown"
 
 
-def get_email_thread(contact_id: str, limit: int = 12) -> list[dict]:
+def get_email_thread(contact_id: str, limit: int = 20) -> list[dict]:
     """Pull the chronological email exchange for a contact from HubSpot.
 
     Returns a list of {"sender", "timestamp", "subject", "body"} oldest-first.
@@ -532,33 +532,38 @@ def get_email_thread(contact_id: str, limit: int = 12) -> list[dict]:
     """
     if not contact_id:
         return []
-    url = f"{HUBSPOT_BASE}/crm/v3/objects/emails/search"
-    payload = {
-        "filterGroups": [
-            {"filters": [{"propertyName": "associations.contact", "operator": "EQ", "value": str(contact_id)}]}
-        ],
-        "properties": [
-            "hs_timestamp", "hs_email_subject", "hs_email_text",
-            "hs_email_from_email", "hs_email_to_email",
-        ],
-        "sorts": [{"propertyName": "hs_timestamp", "direction": "ASCENDING"}],
-        "limit": limit,
-    }
+    props = [
+        "hs_timestamp", "hs_email_subject", "hs_email_text",
+        "hs_email_from_email", "hs_email_to_email",
+    ]
     try:
-        resp = requests.post(url, headers=_hs_headers(), json=payload, timeout=15)
-        resp.raise_for_status()
+        # 1. List the email engagements associated with this contact.
+        assoc_url = f"{HUBSPOT_BASE}/crm/v4/objects/contacts/{contact_id}/associations/emails"
+        ar = requests.get(assoc_url, headers=_hs_headers(), params={"limit": 100}, timeout=15)
+        ar.raise_for_status()
+        email_ids = [a["toObjectId"] for a in ar.json().get("results", []) if a.get("toObjectId")]
+        if not email_ids:
+            return []
+
+        # 2. Batch-read the bodies (search-by-association is unreliable for engagements).
+        read_url = f"{HUBSPOT_BASE}/crm/v3/objects/emails/batch/read"
+        payload = {"properties": props, "inputs": [{"id": str(i)} for i in email_ids[:limit]]}
+        rr = requests.post(read_url, headers=_hs_headers(), json=payload, timeout=20)
+        rr.raise_for_status()
+
         thread = []
-        for e in resp.json().get("results", []):
+        for e in rr.json().get("results", []):
             p = e.get("properties", {})
             body = (p.get("hs_email_text") or "").strip()
             if not body:
                 continue
             thread.append({
                 "sender": _email_direction(p),
-                "timestamp": p.get("hs_timestamp", ""),
+                "timestamp": p.get("hs_timestamp", "") or "",
                 "subject": p.get("hs_email_subject", ""),
                 "body": body,
             })
+        thread.sort(key=lambda m: m["timestamp"])  # ISO-8601 sorts chronologically
         return thread
     except Exception as exc:
         log.warning(f"HubSpot email thread fetch failed for contact {contact_id}: {exc}")
