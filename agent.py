@@ -459,8 +459,32 @@ def get_pending_rows(sheet: gspread.Worksheet) -> list[tuple[int, list[str]]]:
     return pending
 
 
+def sanitize_text(s: str) -> str:
+    """Hard filter applied to drafted text before it lands in the sheet. The system
+    prompt asks the model to avoid AI tells, but this enforces it regardless: no
+    em/en-dashes, no special symbols, plain quotes. Ranges (tight en-dashes) become
+    hyphens; asides (spaced dashes) become commas."""
+    if not s:
+        return s
+    s = re.sub(r"\s*—\s*", ", ", s)        # em-dash (always an aside) -> ", "
+    s = re.sub(r"\s+–\s+", ", ", s)        # spaced en-dash (aside) -> ", "
+    s = s.replace("–", "-")                # tight en-dash (range) -> hyphen
+    s = s.replace("×", "x").replace("≈", "about ").replace("•", "-")
+    s = re.sub(r"\s*→\s*", " to ", s)      # arrow -> "to"
+    s = s.replace("’", "'").replace("‘", "'")   # curly single quotes
+    s = s.replace("“", '"').replace("”", '"')   # curly double quotes
+    s = s.replace("…", "...").replace(" ", " ")  # ellipsis, nbsp
+    s = s.replace(" ,", ",")
+    s = re.sub(r",[ ]*,", ", ", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"(^|\n),\s*", r"\1", s)    # drop a stray leading comma
+    return s.strip()
+
+
 def format_guidance(action: str, response: str, notes: str) -> str:
     """Format all guidance into a single readable cell for the BDR."""
+    response = sanitize_text(response)
+    notes = sanitize_text(notes)
     parts = [f"ACTION: {action}"]
     if response:
         parts.append(f"\nSUGGESTED RESPONSE:\n{response}")
