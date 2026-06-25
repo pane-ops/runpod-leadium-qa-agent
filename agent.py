@@ -701,11 +701,18 @@ def probe_email_thread(email: str) -> None:
         rr = requests.post(
             f"{HUBSPOT_BASE}/crm/v3/objects/emails/batch/read",
             headers=_hs_headers(),
-            json={"properties": ["hs_timestamp", "hs_email_from_email", "hs_email_subject", "hs_email_text"],
+            json={"properties": ["hs_timestamp", "hs_email_from_email", "hs_email_subject",
+                                 "hs_email_text", "hs_email_html"],
                   "inputs": [{"id": str(i)} for i in ids[:20]]},
             timeout=20,
         )
-        print(f"[diag] batch/read status={rr.status_code} body={rr.text[:800]}\n")
+        print(f"[diag] batch/read status={rr.status_code}")
+        for e in rr.json().get("results", []):
+            p = e.get("properties", {})
+            txt = p.get("hs_email_text")
+            html = p.get("hs_email_html")
+            print(f"[diag]   id={e.get('id')} from={p.get('hs_email_from_email')} "
+                  f"text_len={len(txt) if txt else 0} html_len={len(html) if html else 0}")
 
     thread = get_email_thread(contact["id"])
     print(f"Email thread: {len(thread)} message(s)\n")
